@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -126,7 +127,7 @@ var (
 	geoNetsV6CIDR []*net.IPNet
 	geoRangesV4   []ipv4Range
 	geoRangesV6   []ipv6Range
-	geoNetsCC     = make(map[string]string) // по-прежнему можно хранить CIDR->CC
+	geoNetsCC     = make(map[string]string) // CIDR->CC
 
 	geoCache = make(map[string]geoCacheVal)
 	geoCacheMu sync.RWMutex
@@ -136,7 +137,7 @@ var (
 	reTilde   = regexp.MustCompile(`~([A-Za-z0-9_-]+)`)
 )
 
-// simple mapping ISO code -> country name (дополни по необходимости)
+// simple mapping ISO code -> country name
 var countryNames = map[string]string{
 	"AF": "Afghanistan",
 	"AX": "Åland Islands",
@@ -487,18 +488,83 @@ func pickFreePort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
-// waitForControlPort waits until controlAddr is accepting connections or timeout
-func waitForControlPort(controlAddr string, timeout time.Duration) error {
+func readCookieHex(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil { return "", err }
+	return fmt.Sprintf("%x", b), nil
+}
+
+func authenticateWithRetries(conn net.Conn, cookiePath string, tries int, delay time.Duration) error {
+	r := bufio.NewReader(conn)
+	for i := 0; i < tries; i++ {
+		cookieHex, err := readCookieHex(cookiePath)
+		if err != nil {
+			time.Sleep(delay)
+			continue
+		}
+
+		_, _ = fmt.Fprintf(conn, "AUTHENTICATE %s\r\n", cookieHex)
+		resp, err := r.ReadString('\n')
+		if err != nil {
+			time.Sleep(delay)
+			continue
+		}
+		if strings.Contains(resp, "250") {
+			return nil
+		}
+
+		logf("AUTH attempt %d response: %s", i+1, strings.TrimSpace(resp))
+		time.Sleep(delay)
+	}
+	return fmt.Errorf("authenticate failed after %d tries", tries)
+}
+
+func connectAndAuthenticate(controlAddr, cookiePath string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", controlAddr, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	time.Sleep(1 * time.Second)
+
+	if err := authenticateWithRetries(conn, cookiePath, 3, 1*time.Second); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func waitForControlConn(controlAddr string, timeout time.Duration) (net.Conn, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", controlAddr, 500*time.Millisecond)
 		if err == nil {
-			_ = conn.Close()
-			return nil
+			time.Sleep(1 * time.Second)
+			return conn, nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("control port %s not available after %s", controlAddr, timeout)
+	return nil, fmt.Errorf("control port %s not available after %s", controlAddr, timeout)
+}
+
+func waitForControlPort(controlAddr, cookiePath string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", controlAddr, 500*time.Millisecond)
+		if err != nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		time.Sleep(1 * time.Second)
+
+		if err := authenticateWithRetries(conn, cookiePath, 3, 1*time.Second); err == nil {
+			conn.Close()
+			return nil
+		}
+		conn.Close()
+	}
+	return fmt.Errorf("control port %s not available or authenticate failed after %s", controlAddr, timeout)
 }
 
 // readControlCookie reads control_auth_cookie from dataDir and returns hex string
@@ -565,13 +631,14 @@ func parseBootstrapInfo(resp string) (int, string) {
 // It waits until Tor reaches PROGRESS 100 or until ctx is done.
 func monitorBootstrap(ctx context.Context, controlAddr, dataDir string, pollInterval time.Duration) (int, string, error) {
 	// Wait for control port to be listening
-	if err := waitForControlPort(controlAddr, 20*time.Second); err != nil {
+	cookiePath := filepath.Join(dataDir, "control_auth_cookie")
+	if err := waitForControlPort(controlAddr, cookiePath, 20*time.Second); err != nil {
 		return 0, "", fmt.Errorf("control port not available: %w", err)
 	}
 	logf("control port %s is open", controlAddr)
 
 	// Wait for control_auth_cookie to appear and be non-empty (prefer cookie auth)
-	cookiePath := filepath.Join(dataDir, "control_auth_cookie")
+	cookiePath = filepath.Join(dataDir, "control_auth_cookie")
 	cookieWaitUntil := time.Now().Add(30 * time.Second)
 	cookieReady := false
 	for {
@@ -624,7 +691,7 @@ func monitorBootstrap(ctx context.Context, controlAddr, dataDir string, pollInte
 			logf("authenticated with empty cookie fallback")
 		}
 	} else {
-		// cookie not available — try empty authenticate once
+		// cookie not available ? try empty authenticate once
 		resp, err := sendControlCommand(conn, `AUTHENTICATE ""`)
 		if err != nil || !strings.HasPrefix(resp, "250") {
 			return 0, "", fmt.Errorf("authenticate empty failed and cookie not available: %v; resp: %v", err, resp)
@@ -644,7 +711,7 @@ func monitorBootstrap(ctx context.Context, controlAddr, dataDir string, pollInte
 			case <-ticker.C:
 				resp, err := sendControlCommand(conn, "GETINFO status/bootstrap-phase")
 				if err != nil {
-					// transient error — log and continue until ctx timeout
+					// transient error ? log and continue until ctx timeout
 					logf("GETINFO transient error: %v", err)
 					continue
 				}
@@ -779,7 +846,7 @@ func loadGeoFlexible(path string) error {
 		// last part is country code
 		cc := parts[len(parts)-1]
 
-		// Case A: CIDR (first part contains '/')
+		// CIDR (first part contains '/')
 		first := parts[0]
 		if strings.Contains(first, "/") {
 			if _, ipnet, err := net.ParseCIDR(first); err == nil {
@@ -794,7 +861,6 @@ func loadGeoFlexible(path string) error {
 			// if ParseCIDR failed, fallthrough to other parsers
 		}
 
-		// Case B: IPv4 decimal range: startDecimal,endDecimal,CC
 		// detect by numeric first token without ':' and not containing letters
 		if _, err := strconv.ParseUint(first, 10, 64); err == nil && !strings.Contains(first, ":") {
 			// expect at least 3 parts: start,end,CC
@@ -811,7 +877,6 @@ func loadGeoFlexible(path string) error {
 			}
 		}
 
-		// Case C: IPv6 textual range: startIP,endIP,CC
 		// detect by presence of ':' in first token
 		if strings.Contains(first, ":") {
 			if len(parts) >= 3 {
@@ -974,6 +1039,16 @@ func extractBridgeNameFromText(s string) string {
 }
 
 // ----------------- data cache population utilities -----------------
+func resolveUIDGID(preferred string) (int, int) {
+	if preferred != "" {
+		if u, err := user.Lookup(preferred); err == nil {
+			uid, _ := strconv.Atoi(u.Uid)
+			gid, _ := strconv.Atoi(u.Gid)
+			return uid, gid
+		}
+	}
+	return os.Geteuid(), os.Getegid()
+}
 
 // copyFile copies file from src to dst preserving mode.
 func copyFile(src, dst string) error {
@@ -1068,7 +1143,7 @@ func populateDataDirFromCache(cacheDir, dataDir string) error {
 		src := filepath.Join(cacheDir, it)
 		dst := filepath.Join(dataDir, it)
 		if _, err := os.Stat(src); err != nil {
-			// source missing — skip silently
+			// source missing ? skip silently
 			continue
 		}
 		si, _ := os.Stat(src)
@@ -1085,7 +1160,18 @@ func populateDataDirFromCache(cacheDir, dataDir string) error {
 		}
 	}
 	// ensure permissions
-	_ = os.Chmod(dataDir, 0700)
+	uid, gid := resolveUIDGID("root")
+	_ = filepath.Walk(dataDir, func(p string, fi os.FileInfo, err error) error {
+		if err != nil { return nil }
+		_ = os.Chown(p, uid, gid)
+		if fi.IsDir() {
+			_ = os.Chmod(p, 0700)
+		} else {
+			_ = os.Chmod(p, 0600)
+		}
+		return nil
+	})
+	_ = exec.Command("setfacl", "-bR", dataDir).Run()
 	return nil
 }
 
@@ -1310,8 +1396,8 @@ func runTorCheckWithTorrc(parentCtx context.Context, torPath, baseTemplate, lyre
 	}(cmd.Process.Pid)
 
 	// wait for control port to open
-	if err := waitForControlPort(controlAddr, 12*time.Second); err != nil {
-		// read some log bytes for notes
+	cookiePath := filepath.Join(dataDir, "control_auth_cookie")
+	if err := waitForControlPort(controlAddr, cookiePath, 20*time.Second); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		_ = logFile.Close()
@@ -1362,7 +1448,7 @@ func runTorCheckWithTorrc(parentCtx context.Context, torPath, baseTemplate, lyre
 
 	// if monitor returned error, wait a bit for diagnostics before killing
 	if monErr != nil {
-		logf("monitorBootstrap error: %v — sleeping 12s for diagnostics before killing tor", monErr)
+		logf("monitorBootstrap error: %v ? sleeping 12s for diagnostics before killing tor", monErr)
 		time.Sleep(12 * time.Second)
 	}
 
@@ -1698,15 +1784,15 @@ func applyResult(db *sql.DB, id int64, status string, latencyMs sql.NullInt64, n
 	SET status = $1,
 	last_checked_at = now(),
 			 latency_ms = $2,
-			 notes = $3,
-			 check_count = COALESCE(check_count,0) + 1,
+		  notes = $3,
+		  check_count = COALESCE(check_count,0) + 1,
 			 consecutive_timeouts = CASE WHEN $4 THEN COALESCE(consecutive_timeouts,0) + 1 ELSE 0 END,
 			 country_code = $5,
-			 country_name = $6,
-			 geo_provider = $7,
-			 bridge_name = $8
-			 WHERE id = $9
-			 `, status, latencyMs, notes, isTimeout, cc, cn, gp, bn, id)
+		  country_name = $6,
+		  geo_provider = $7,
+		  bridge_name = $8
+		  WHERE id = $9
+		  `, status, latencyMs, notes, isTimeout, cc, cn, gp, bn, id)
 	if err != nil {
 		return err
 	}
@@ -2036,7 +2122,7 @@ func main() {
 
 	runOnceFunc := func() {
 		if !isNetworkUp(2*time.Second) {
-			logf("network unreachable — skipping this poll")
+			logf("network unreachable ? skipping this poll")
 			return
 		}
 		cands, err := fetchCandidates(appCtx, db, *checkOlderThan, *batchSize, *checkStatus, *checkTypeFlag, *checkID)
