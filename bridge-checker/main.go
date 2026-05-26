@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -117,6 +118,12 @@ func logf(format string, a ...interface{}) {
 // globalRunning: pid -> struct{} for tor processes started by checker
 // globalRunningCanc: pid -> cancel func for the monitor context
 //
+const (
+	defaultDialTimeout = 5 * time.Second
+	defaultAuthTries   = 3
+	defaultAuthDelay   = 1 * time.Second
+)
+
 var (
 	globalRunning       = make(map[int]struct{})
 	globalRunningMu     sync.Mutex
@@ -519,62 +526,29 @@ func authenticateWithRetries(conn net.Conn, cookiePath string, tries int, delay 
 	return fmt.Errorf("authenticate failed after %d tries", tries)
 }
 
-func connectAndAuthenticate(controlAddr, cookiePath string, timeout time.Duration) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", controlAddr, 5*time.Second)
-	if err != nil {
-		return nil, err
-	}
-
+func connectAndAuth(controlAddr, cookiePath string, dialTimeout time.Duration, tries int, delay time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", controlAddr, dialTimeout)
+	if err != nil { return nil, err }
 	time.Sleep(1 * time.Second)
-
-	if err := authenticateWithRetries(conn, cookiePath, 3, 1*time.Second); err != nil {
+	if err := authenticateWithRetries(conn, cookiePath, tries, delay); err != nil {
 		conn.Close()
 		return nil, err
 	}
 	return conn, nil
 }
 
-func waitForControlConn(controlAddr string, timeout time.Duration) (net.Conn, error) {
-	deadline := time.Now().Add(timeout)
+func waitForControlPort(controlAddr, cookiePath string, overallTimeout time.Duration) error {
+	deadline := time.Now().Add(overallTimeout)
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", controlAddr, 500*time.Millisecond)
+		conn, err := connectAndAuth(controlAddr, cookiePath, defaultDialTimeout, defaultAuthTries, defaultAuthDelay)
 		if err == nil {
-			time.Sleep(1 * time.Second)
-			return conn, nil
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	return nil, fmt.Errorf("control port %s not available after %s", controlAddr, timeout)
-}
-
-func waitForControlPort(controlAddr, cookiePath string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", controlAddr, 500*time.Millisecond)
-		if err != nil {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-
-		time.Sleep(1 * time.Second)
-
-		if err := authenticateWithRetries(conn, cookiePath, 3, 1*time.Second); err == nil {
 			conn.Close()
 			return nil
 		}
-		conn.Close()
+		logf("waitForControlPort: connect/auth failed: %v; retrying until %s", err, deadline.Format(time.RFC3339))
+		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("control port %s not available or authenticate failed after %s", controlAddr, timeout)
-}
-
-// readControlCookie reads control_auth_cookie from dataDir and returns hex string
-func readControlCookie(dataDir string) (string, error) {
-	cookiePath := filepath.Join(dataDir, "control_auth_cookie")
-	b, err := os.ReadFile(cookiePath)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", b), nil
+	return fmt.Errorf("control port %s not available or authenticate failed after %s", controlAddr, overallTimeout)
 }
 
 // sendControlCommand sends a command and reads response block.
@@ -1122,6 +1096,57 @@ func copyDirIfNotExists(srcDir, dstDir string) error {
 	return nil
 }
 
+func getCurrentProcessOwner() (uid int, gid int, username string, err error) {
+	cur, err := user.Current()
+	if err == nil {
+		uidVal, _ := strconv.Atoi(cur.Uid)
+		gidVal, _ := strconv.Atoi(cur.Gid)
+		if os.Geteuid() != 0 {
+			return uidVal, gidVal, cur.Username, nil
+		}
+		return 0, 0, "root", nil
+	}
+
+	// fallback: use euid/egid
+	euid := os.Geteuid()
+	egid := os.Getegid()
+	return euid, egid, fmt.Sprintf("%d", euid), nil
+}
+
+func applyOwnershipAndPerms(dataDir string, uid, gid int) error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+
+	err := filepath.WalkDir(dataDir, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			fmt.Printf("walk error %s: %v\n", p, walkErr)
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if err := os.Chown(p, uid, gid); err != nil {
+			fmt.Printf("chown %s -> %d:%d failed: %v\n", p, uid, gid, err)
+		}
+		if info.IsDir() {
+			_ = os.Chmod(p, 0700)
+		} else {
+			_ = os.Chmod(p, 0600)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if _, err := exec.LookPath("setfacl"); err == nil {
+		_ = exec.Command("setfacl", "-bR", dataDir).Run()
+	}
+	return nil
+}
+
 // populateDataDirFromCache copies a set of cached files into dataDir if missing.
 func populateDataDirFromCache(cacheDir, dataDir string) error {
 	if cacheDir == "" {
@@ -1135,8 +1160,6 @@ func populateDataDirFromCache(cacheDir, dataDir string) error {
 		"cached-microdesc-consensus",
 		"cached-microdescs",
 		"cached-microdescs.new",
-		"keys",
-		"pt_state",
 		"torrc",
 	}
 	for _, it := range items {
@@ -1160,18 +1183,11 @@ func populateDataDirFromCache(cacheDir, dataDir string) error {
 		}
 	}
 	// ensure permissions
-	uid, gid := resolveUIDGID("root")
-	_ = filepath.Walk(dataDir, func(p string, fi os.FileInfo, err error) error {
-		if err != nil { return nil }
-		_ = os.Chown(p, uid, gid)
-		if fi.IsDir() {
-			_ = os.Chmod(p, 0700)
-		} else {
-			_ = os.Chmod(p, 0600)
-		}
-		return nil
-	})
-	_ = exec.Command("setfacl", "-bR", dataDir).Run()
+	uid, gid, userName, _ := getCurrentProcessOwner()
+	logf("apply ownership for dataDir as user %s (%d:%d)", userName, uid, gid)
+	if err := applyOwnershipAndPerms(dataDir, uid, gid); err != nil {
+		logf("applyOwnershipAndPerms error: %v", err)
+	}
 	return nil
 }
 
