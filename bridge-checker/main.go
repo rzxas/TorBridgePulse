@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"reflect"
 	"syscall"
 	"time"
 	"math/big"
@@ -102,9 +103,12 @@ var (
 	waitTimeout     = flag.Duration("wait-timeout", 0, "maximum wait time like 30m; 0 means wait forever (default 0)")
 	checkStatus 	= flag.String("check", "all", "status to check: alive|dead|timeout|unknown|all")
 	checkID     	= flag.Int("id", 0, "check single bridge by id (overrides -check)")
+	checkTypeFlag   = flag.String("type", "all", "Type to check: obfs4|webtunnel|all")
 
 	// new flags
-	checkTypeFlag   = flag.String("type", "all", "Type to check: obfs4|webtunnel|all")
+	printAlive = flag.Bool("print-alive", false, "Print alive bridges to console")
+	outPath    = flag.String("out", "", "Path to output file")
+	roMode     = flag.Bool("ro", false, "Run in read-only mode: use only raw_line and do not write to DB")
 )
 
 func logf(format string, a ...interface{}) {
@@ -142,6 +146,9 @@ var (
 
 	reLogName = regexp.MustCompile(`new bridge descriptor '([^']+)'`)
 	reTilde   = regexp.MustCompile(`~([A-Za-z0-9_-]+)`)
+
+	sharedSeen = make(map[int]struct{})
+	seenMu sync.Mutex
 )
 
 // simple mapping ISO code -> country name
@@ -1780,6 +1787,241 @@ func fetchCandidates(ctx context.Context, db *sql.DB, olderThan string, limit in
 	return out, nil
 }
 
+// printAliveBridges queries get_bridges_for_user and prints alive bridges.
+// It expects the DB function to return id, raw_line, allowed_raw.
+func printAliveBridges(ctx context.Context, db *sql.DB, outFile string, ro bool) error {
+	var userID int64
+	if err := db.QueryRowContext(ctx, "SELECT bridges.ensure_app_user()").Scan(&userID); err != nil {
+		return fmt.Errorf("ensure_app_user failed: %w", err)
+	}
+
+	rows, err := db.QueryContext(ctx, "SELECT id, raw_line, allowed_raw FROM bridges.get_bridges_for_user($1)", userID)
+	if err != nil {
+		return fmt.Errorf("get_bridges_for_user failed: %w", err)
+	}
+	defer rows.Close()
+
+	var f *os.File
+	if outFile != "" {
+		f, err = os.OpenFile(outFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fmt.Errorf("open out file: %w", err)
+		}
+		defer f.Close()
+		_, _ = f.WriteString("type\traw_line\tcountry_name\tcountry_code\tbridge_name\tlatency_ms\tstatus\n")
+	}
+
+	qt := *quickTimeout
+
+	for rows.Next() {
+		var id int64
+		var raw sql.NullString
+		var allowed bool
+
+		if err := rows.Scan(&id, &raw, &allowed); err != nil {
+			fmt.Fprintf(os.Stderr, "scan row err: %v\n", err)
+			continue
+		}
+
+		if !allowed {
+			fmt.Fprintf(os.Stderr, "raw not allowed for id=%d, skipping\n", id)
+			continue
+		}
+		if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+			fmt.Fprintf(os.Stderr, "empty raw_line for id=%d, skipping\n", id)
+			continue
+		}
+
+		res := processRawLine(ctx, db, raw.String, qt, sharedSeen, &seenMu)
+		if res.Err != nil {
+			log.Printf("check failed id=%d: %v", id, res.Err)
+			continue
+		}
+		if !res.Alive {
+			continue
+		}
+
+		typ := "unknown"
+		latency := fmt.Sprintf("%d", res.LatencyMs)
+		status := "alive"
+		line := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				    typ,
+		      strings.ReplaceAll(raw.String, "\t", " "),
+				    res.CountryName,
+		      res.CountryCode,
+		      res.BridgeName,
+		      latency,
+		      status,
+		)
+
+		// print to console
+		fmt.Print(line)
+
+		// write to file if requested
+		if f != nil {
+			if _, err := f.WriteString(time.Now().Format(time.RFC3339) + "\t" + line); err != nil {
+				fmt.Fprintf(os.Stderr, "write out file err: %v\n", err)
+			}
+		}
+
+		// write to DB only if not ro and role has rights; handle permission errors gracefully
+		if !ro {
+			if _, err := db.ExecContext(ctx, "SELECT bridges.record_alive($1,$2)", userID, id); err != nil {
+				fmt.Fprintf(os.Stderr, "DB write failed for id=%d: %v\n", id, err)
+				ro = true
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("rows err: %w", err)
+	}
+	return nil
+}
+
+type PRResult struct {
+	Alive       bool
+	LatencyMs   int64
+	CountryName string
+	CountryCode string
+	BridgeName  string
+	Err         error
+}
+
+func processRawLine(parentCtx context.Context, db *sql.DB, rawLine string, timeout time.Duration, sharedMap map[int]struct{}, sharedMu *sync.Mutex) PRResult {
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
+	defer cancel()
+
+	raw := strings.TrimSpace(rawLine)
+	if raw == "" {
+		return PRResult{Alive: false, Err: fmt.Errorf("empty raw_line")}
+	}
+
+	var br BridgeRow
+
+	setFieldIfExists(&br, "RawLine", raw)
+	setFieldIfExists(&br, "Raw", raw)
+	setFieldIfExists(&br, "RawString", raw)
+
+	err := checkBridgeRow(ctx, db, br, "", "", "", "", "", 0, timeout, false, false, sharedMap, sharedMu)
+	if err != nil {
+		return PRResult{Alive: false, Err: err}
+	}
+
+	res := PRResult{}
+
+	if v, ok := getBoolField(&br, []string{"Alive", "IsAlive", "AliveBool", "Up", "IsUp"}); ok {
+		res.Alive = v
+	} else if s, ok := getStringField(&br, []string{"Status", "State"}); ok {
+		st := strings.ToLower(s)
+		res.Alive = strings.Contains(st, "alive") || strings.Contains(st, "up")
+	}
+
+	if i, ok := getInt64Field(&br, []string{"LatencyMs", "Latency", "RTT", "PingMs"}); ok {
+		res.LatencyMs = i
+	}
+
+	// Country code / name
+	if s, ok := getStringField(&br, []string{"CountryCode", "CC", "Country"}); ok {
+		res.CountryCode = s
+	}
+	if s, ok := getStringField(&br, []string{"CountryName", "CountryFull", "Country"}); ok && res.CountryName == "" {
+		res.CountryName = s
+	}
+
+	// Bridge name
+	if s, ok := getStringField(&br, []string{"Name", "BridgeName", "Nickname"}); ok {
+		res.BridgeName = s
+	}
+
+	return res
+}
+
+func setFieldIfExists(dst interface{}, name string, raw string) {
+	v := reflect.ValueOf(dst)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return
+	}
+	v = v.Elem()
+	f := v.FieldByName(name)
+	if !f.IsValid() || !f.CanSet() {
+		return
+	}
+	switch f.Kind() {
+		case reflect.String:
+			f.SetString(raw)
+		case reflect.Struct:
+			if f.Type() == reflect.TypeOf(sql.NullString{}) {
+				ns := sql.NullString{String: raw, Valid: true}
+				f.Set(reflect.ValueOf(ns))
+			}
+	}
+}
+
+func getStringField(src interface{}, names []string) (string, bool) {
+	v := reflect.ValueOf(src)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	for _, n := range names {
+		f := v.FieldByName(n)
+		if !f.IsValid() {
+			continue
+		}
+		switch f.Kind() {
+			case reflect.String:
+				return f.String(), true
+			case reflect.Struct:
+				if f.Type() == reflect.TypeOf(sql.NullString{}) {
+					ns := f.Interface().(sql.NullString)
+					if ns.Valid {
+						return ns.String, true
+					}
+				}
+		}
+	}
+	return "", false
+}
+
+func getBoolField(src interface{}, names []string) (bool, bool) {
+	v := reflect.ValueOf(src)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	for _, n := range names {
+		f := v.FieldByName(n)
+		if !f.IsValid() {
+			continue
+		}
+		if f.Kind() == reflect.Bool {
+			return f.Bool(), true
+		}
+	}
+	return false, false
+}
+
+func getInt64Field(src interface{}, names []string) (int64, bool) {
+	v := reflect.ValueOf(src)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	for _, n := range names {
+		f := v.FieldByName(n)
+		if !f.IsValid() {
+			continue
+		}
+		switch f.Kind() {
+			case reflect.Int64:
+				return f.Int(), true
+			case reflect.Int, reflect.Int32:
+				return int64(f.Int()), true
+			case reflect.Uint64, reflect.Uint, reflect.Uint32:
+				return int64(f.Uint()), true
+		}
+	}
+	return 0, false
+}
+
 // applyResult updates DB atomically
 func applyResult(db *sql.DB, id int64, status string, latencyMs sql.NullInt64, notes string, isTimeout bool, countryCode, countryName, geoProvider, bridgeName string) error {
 	// convert optional geo fields to sql.NullString
@@ -2086,9 +2328,9 @@ func main() {
 
 		if err := checkBridgeByID(
 			context.Background(),
-					  db,
+			    db,
 			    int64(*checkID),
-					  baseTemplate,
+			    baseTemplate,
 			    *lyrebirdPlugin,
 			    *baseTmpDir,
 			    persistentDataDir,
@@ -2104,6 +2346,15 @@ func main() {
 		}
 
 		log.Printf("single-run id=%d finished, exiting", *checkID)
+		return
+	}
+
+	if *printAlive {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := printAliveBridges(ctx, db, *outPath, *roMode); err != nil {
+			log.Fatalf("print-alive failed: %v", err)
+		}
 		return
 	}
 
